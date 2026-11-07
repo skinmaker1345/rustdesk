@@ -94,6 +94,17 @@ const PRIVILEGED_UPDATE_BODY: &str = r#"
 /// This prevents race conditions between cursor visibility (hide depth tracking)
 /// and cursor positioning/clipping operations.
 static CG_CURSOR_MUTEX: Mutex<()> = Mutex::new(());
+static SMOOZE_PRO_STATE: Mutex<SmoozeProState> = Mutex::new(SmoozeProState {
+    remote_connections: 0,
+    stopped_by_rustdesk: false,
+});
+
+struct SmoozeProState {
+    remote_connections: usize,
+    stopped_by_rustdesk: bool,
+}
+
+const SMOOZE_PRO_BUNDLE_ID: &str = "co.smoozepro.macos";
 
 extern "C" {
     fn CGSCurrentCursorSeed() -> i32;
@@ -390,6 +401,71 @@ fn check_ax_status(status: i32, action: &str) -> ResultType<()> {
 
 pub fn is_process_trusted(prompt: bool) -> bool {
     autoreleasepool(|| unsafe_is_process_trusted(prompt))
+}
+
+pub fn smooze_pro_remote_connection_opened() {
+    let mut state = SMOOZE_PRO_STATE.lock().unwrap();
+    state.remote_connections += 1;
+    if state.remote_connections != 1 {
+        return;
+    }
+
+    state.stopped_by_rustdesk = autoreleasepool(|| unsafe_stop_smooze_pro());
+}
+
+pub fn smooze_pro_remote_connection_closed() {
+    let should_restart = {
+        let mut state = SMOOZE_PRO_STATE.lock().unwrap();
+        if state.remote_connections == 0 {
+            log::error!("Smooze Pro remote connection count underflow");
+            return;
+        }
+        state.remote_connections -= 1;
+        if state.remote_connections != 0 || !state.stopped_by_rustdesk {
+            return;
+        }
+        state.stopped_by_rustdesk = false;
+        true
+    };
+
+    if should_restart {
+        std::thread::spawn(|| {
+            match Command::new("/usr/bin/open")
+                .args(["-b", SMOOZE_PRO_BUNDLE_ID])
+                .status()
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    log::error!("Failed to relaunch Smooze Pro: {}", status);
+                }
+                Err(err) => {
+                    log::error!("Failed to launch Smooze Pro: {}", err);
+                }
+            }
+        });
+    }
+}
+
+fn unsafe_stop_smooze_pro() -> bool {
+    unsafe {
+        let bundle_id: id = NSString::alloc(nil).init_str(SMOOZE_PRO_BUNDLE_ID);
+        let applications: id = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationsWithBundleIdentifier: bundle_id
+        ];
+        let count: usize = msg_send![applications, count];
+        let mut stopped = false;
+        for index in 0..count {
+            let application: id = msg_send![applications, objectAtIndex: index];
+            let terminated: BOOL = msg_send![application, forceTerminate];
+            if terminated == YES {
+                stopped = true;
+            } else {
+                log::error!("Failed to terminate Smooze Pro");
+            }
+        }
+        stopped
+    }
 }
 
 fn unsafe_is_process_trusted(prompt: bool) -> bool {

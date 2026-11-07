@@ -24,6 +24,11 @@ use crate::{
 };
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use crate::{common::DEVICE_NAME, flutter::connection_manager::start_channel};
+use base::{
+    config::keys,
+    fs::{self, can_enable_overwrite_detection, JobType},
+    message_proto::{option_message::BoolOption, permission_info::Permission},
+};
 use cidr_utils::cidr::IpCidr;
 #[cfg(target_os = "android")]
 use hbb_common::protobuf::EnumOrUnknown;
@@ -44,11 +49,6 @@ use hbb_common::{
         time::{self, Duration, Instant},
     },
     tokio_util::codec::{BytesCodec, Framed},
-};
-use base::{
-    config::keys,
-    fs::{self, can_enable_overwrite_detection, JobType},
-    message_proto::{option_message::BoolOption, permission_info::Permission},
 };
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use scrap::android::{call_main_service_key_event, call_main_service_pointer_input};
@@ -2202,7 +2202,8 @@ impl Connection {
             self.keyboard = false;
             let is_existing_dir = !dir.is_empty() && std::path::Path::new(&dir).is_dir();
             #[cfg(target_os = "android")]
-            let is_existing_dir = is_existing_dir || fs::android::is_path(std::path::Path::new(&dir));
+            let is_existing_dir =
+                is_existing_dir || fs::android::is_path(std::path::Path::new(&dir));
             #[cfg(target_os = "android")]
             let is_allowed_dir =
                 is_existing_dir && crate::common::is_peer_path_allowed_async(&dir, false).await;
@@ -4124,7 +4125,9 @@ impl Connection {
                         self.refresh_video_display(Some(request.display as usize));
                     }
                 }
-                Some(message::Union::PortForwardChannel(ch)) => self.handle_port_forward_channel(ch),
+                Some(message::Union::PortForwardChannel(ch)) => {
+                    self.handle_port_forward_channel(ch)
+                }
                 Some(message::Union::TerminalAction(action)) => {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     allow_err!(self.handle_terminal_action(action).await);
@@ -6949,6 +6952,10 @@ mod raii {
                 sender,
                 printer,
             });
+            #[cfg(target_os = "macos")]
+            if conn_type == AuthConnType::Remote {
+                crate::platform::macos::smooze_pro_remote_connection_opened();
+            }
             Self::check_wake_lock();
             use std::sync::Once;
             static _ONCE: Once = Once::new();
@@ -7087,6 +7094,10 @@ mod raii {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             clear_relative_mouse_active(self.0);
             AUTHED_CONNS.lock().unwrap().retain(|c| c.conn_id != self.0);
+            #[cfg(target_os = "macos")]
+            if self.1 == AuthConnType::Remote {
+                crate::platform::macos::smooze_pro_remote_connection_closed();
+            }
             let remote_count = AUTHED_CONNS
                 .lock()
                 .unwrap()
