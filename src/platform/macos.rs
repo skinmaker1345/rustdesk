@@ -16,7 +16,7 @@ use cocoa::{
     foundation::{NSDictionary, NSPoint, NSSize, NSString},
 };
 use core_foundation::{
-    array::{CFArrayGetCount, CFArrayGetValueAtIndex},
+    array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef},
     dictionary::CFDictionaryRef,
     string::CFStringRef,
 };
@@ -121,8 +121,65 @@ extern "C" {
     fn CGAssociateMouseAndMouseCursorPosition(connected: BooleanT) -> CGError;
 }
 
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn TISCreateInputSourceList(properties: *const c_void, include_all_installed: u8) -> CFArrayRef;
+    fn TISGetInputSourceProperty(
+        input_source: *mut c_void,
+        property_key: *const c_void,
+    ) -> *const c_void;
+    fn TISSelectInputSource(input_source: *mut c_void) -> i32;
+    static kTISPropertyInputSourceIsSelectCapable: *const c_void;
+    static kTISPropertyInputSourceIsSelected: *const c_void;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFBooleanGetValue(boolean: *const c_void) -> u8;
+}
+
 pub fn major_version() -> u32 {
     unsafe { majorVersion() }
+}
+
+pub fn select_next_input_source() -> ResultType<()> {
+    unsafe {
+        let input_sources = TISCreateInputSourceList(std::ptr::null(), 0);
+        if input_sources.is_null() {
+            bail!("macOS did not return enabled input sources");
+        }
+
+        let mut sources = Vec::new();
+        let mut selected_index = None;
+        for index in 0..CFArrayGetCount(input_sources) {
+            let source = CFArrayGetValueAtIndex(input_sources, index) as *mut c_void;
+            let selectable = TISGetInputSourceProperty(
+                source,
+                kTISPropertyInputSourceIsSelectCapable,
+            );
+            if selectable.is_null() || CFBooleanGetValue(selectable) == 0 {
+                continue;
+            }
+            let selected =
+                TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelected);
+            if !selected.is_null() && CFBooleanGetValue(selected) != 0 {
+                selected_index = Some(sources.len());
+            }
+            sources.push(source);
+        }
+
+        if sources.is_empty() {
+            CFRelease(input_sources as _);
+            bail!("macOS has no selectable enabled input sources");
+        }
+        let next_index = selected_index.map_or(0, |index| (index + 1) % sources.len());
+        let status = TISSelectInputSource(sources[next_index]);
+        CFRelease(input_sources as _);
+        if status != 0 {
+            bail!("macOS failed to select the next input source: {status}");
+        }
+    }
+    Ok(())
 }
 
 pub fn is_process_trusted(prompt: bool) -> bool {

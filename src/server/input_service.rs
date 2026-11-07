@@ -1591,6 +1591,14 @@ pub fn handle_key(evt: &KeyEvent) {
 #[inline]
 #[cfg(target_os = "macos")]
 pub fn handle_key(evt: &KeyEvent) {
+    #[cfg(debug_assertions)]
+    log::warn!(
+        "input: host key down={} mode={:?} event={:?}",
+        evt.down,
+        evt.mode,
+        evt.union
+    );
+
     // having GUI, run main GUI thread, otherwise crash
     let evt = evt.clone();
     QUEUE.exec_async(move || handle_key_(&evt));
@@ -1638,6 +1646,13 @@ fn sim_rdev_rawkey_position(code: KeyCode, keydown: bool) {
         EventType::KeyRelease(RdevKey::RawKey(rawkey))
     };
     simulate_(&event_type);
+}
+
+#[cfg(target_os = "macos")]
+fn select_next_macos_input_source() {
+    if let Err(err) = crate::platform::macos::select_next_input_source() {
+        log::error!("Failed to select the next macOS input source: {err}");
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1731,6 +1746,24 @@ fn map_keyboard_mode(evt: &KeyEvent) {
         return;
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        const MACOS_RIGHT_COMMAND_KEYCODE: KeyCode = 0x36;
+        if evt.chr() as KeyCode == MACOS_RIGHT_COMMAND_KEYCODE {
+            #[cfg(debug_assertions)]
+            log::warn!(
+                "input: host map key 0x36 -> next macOS input source down={}",
+                evt.down
+            );
+            if evt.down {
+                select_next_macos_input_source();
+            }
+            return;
+        }
+        sim_rdev_rawkey_position(evt.chr() as _, evt.down);
+    }
+
+    #[cfg(not(target_os = "macos"))]
     sim_rdev_rawkey_position(evt.chr() as _, evt.down);
 }
 
