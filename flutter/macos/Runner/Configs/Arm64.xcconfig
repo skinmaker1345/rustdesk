@@ -1,0 +1,4 @@
+// Flutter's generic macOS destination otherwise builds both arm64 and x86_64.
+// The locally built Rust Flutter library is arm64-only.
+ARCHS = arm64
+EXCLUDED_ARCHS = x86_64
