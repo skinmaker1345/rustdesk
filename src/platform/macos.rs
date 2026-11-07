@@ -10,6 +10,7 @@ mod verified_dmg;
 mod verified_dmg_tests;
 
 use super::{validate_install_app_name, CursorData, ResultType};
+use base::message_proto::{DisplayInfo, Resolution};
 use cocoa::{
     appkit::{NSApp, NSApplication, NSApplicationActivationPolicy::*},
     base::{id, nil, BOOL, NO, YES},
@@ -29,7 +30,6 @@ use hbb_common::{
     bail, log,
     sysinfo::{Pid, Process, ProcessRefreshKind, System},
 };
-use base::message_proto::{DisplayInfo, Resolution};
 use include_dir::{include_dir, Dir};
 use objc::rc::autoreleasepool;
 use objc::{class, msg_send, sel, sel_impl};
@@ -121,9 +121,21 @@ extern "C" {
     fn CGAssociateMouseAndMouseCursorPosition(connected: BooleanT) -> CGError;
 }
 
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXUIElementCreateApplication(pid: i32) -> *const c_void;
+    fn AXUIElementCopyAttributeValue(
+        element: *const c_void,
+        attribute: CFStringRef,
+        value: *mut *const c_void,
+    ) -> i32;
+    fn AXUIElementPerformAction(element: *const c_void, action: CFStringRef) -> i32;
+}
+
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
-    fn TISCreateInputSourceList(properties: *const c_void, include_all_installed: u8) -> CFArrayRef;
+    fn TISCreateInputSourceList(properties: *const c_void, include_all_installed: u8)
+        -> CFArrayRef;
     fn TISGetInputSourceProperty(
         input_source: *mut c_void,
         property_key: *const c_void,
@@ -136,6 +148,7 @@ extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFBooleanGetValue(boolean: *const c_void) -> u8;
+    fn CFRetain(cf: *const c_void) -> *const c_void;
 }
 
 pub fn major_version() -> u32 {
@@ -153,15 +166,12 @@ pub fn select_next_input_source() -> ResultType<()> {
         let mut selected_index = None;
         for index in 0..CFArrayGetCount(input_sources) {
             let source = CFArrayGetValueAtIndex(input_sources, index) as *mut c_void;
-            let selectable = TISGetInputSourceProperty(
-                source,
-                kTISPropertyInputSourceIsSelectCapable,
-            );
+            let selectable =
+                TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelectCapable);
             if selectable.is_null() || CFBooleanGetValue(selectable) == 0 {
                 continue;
             }
-            let selected =
-                TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelected);
+            let selected = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsSelected);
             if !selected.is_null() && CFBooleanGetValue(selected) != 0 {
                 selected_index = Some(sources.len());
             }
@@ -178,6 +188,202 @@ pub fn select_next_input_source() -> ResultType<()> {
         if status != 0 {
             bail!("macOS failed to select the next input source: {status}");
         }
+    }
+    Ok(())
+}
+
+struct CfObject(*const c_void);
+
+impl Drop for CfObject {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CFRelease(self.0);
+            }
+        }
+    }
+}
+
+const AX_MENU_BAR: &str = "AXMenuBar";
+const AX_CHILDREN: &str = "AXChildren";
+const AX_TITLE: &str = "AXTitle";
+const AX_PRESS: &str = "AXPress";
+const WINDOW_MENU: &str = "Window";
+const WINDOW_MENU_TITLES: &[&str] = &[WINDOW_MENU, "창", "윈도우"];
+const MOVE_AND_RESIZE_MENU: &str = "Move & Resize";
+const MOVE_AND_RESIZE_MENU_TITLES: &[&str] = &[MOVE_AND_RESIZE_MENU, "이동 및 크기 조절"];
+const LEFT_TILE_MENU_TITLES: &[&str] = &["Left", "왼쪽"];
+const RIGHT_TILE_MENU_TITLES: &[&str] = &["Right", "오른쪽"];
+const TOP_TILE_MENU_TITLES: &[&str] = &["Top", "상단"];
+const BOTTOM_TILE_MENU_TITLES: &[&str] = &["Bottom", "하단"];
+const FILL_MENU_TITLES: &[&str] = &["Fill", "채우기"];
+
+pub fn tile_focused_window_left() -> ResultType<()> {
+    tile_focused_window(LEFT_TILE_MENU_TITLES)
+}
+
+pub fn tile_focused_window_right() -> ResultType<()> {
+    tile_focused_window(RIGHT_TILE_MENU_TITLES)
+}
+
+pub fn tile_focused_window_top() -> ResultType<()> {
+    tile_focused_window(TOP_TILE_MENU_TITLES)
+}
+
+pub fn tile_focused_window_bottom() -> ResultType<()> {
+    tile_focused_window(BOTTOM_TILE_MENU_TITLES)
+}
+
+pub fn fill_focused_window() -> ResultType<()> {
+    autoreleasepool(unsafe_fill_focused_window)
+}
+
+fn tile_focused_window(side_titles: &[&str]) -> ResultType<()> {
+    autoreleasepool(|| unsafe_tile_focused_window(side_titles))
+}
+
+fn unsafe_tile_focused_window(side_titles: &[&str]) -> ResultType<()> {
+    unsafe {
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let frontmost_application: id = msg_send![workspace, frontmostApplication];
+        if frontmost_application.is_null() {
+            bail!("macOS did not provide a focused application");
+        }
+        let pid: i32 = msg_send![frontmost_application, processIdentifier];
+        let application = CfObject(AXUIElementCreateApplication(pid));
+        if application.0.is_null() {
+            bail!("macOS could not access the focused application");
+        }
+        let menu_bar = CfObject(copy_ax_attribute(
+            application.0,
+            NSString::alloc(nil).init_str(AX_MENU_BAR) as _,
+            "focused application menu bar",
+        )?);
+        let window_menu = find_ax_descendant(menu_bar.0, WINDOW_MENU_TITLES, 2)?
+            .ok_or_else(|| anyhow!("The focused application has no {WINDOW_MENU} menu"))?;
+        press_ax_element(window_menu.0, WINDOW_MENU)?;
+        let move_and_resize = find_ax_descendant(window_menu.0, MOVE_AND_RESIZE_MENU_TITLES, 3)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "The focused application has no {WINDOW_MENU} > {MOVE_AND_RESIZE_MENU} menu"
+                )
+            })?;
+        press_ax_element(move_and_resize.0, MOVE_AND_RESIZE_MENU)?;
+        let side_item =
+            find_ax_descendant(move_and_resize.0, side_titles, 3)?.ok_or_else(|| {
+                anyhow!(
+                "The focused application has no {WINDOW_MENU} > {MOVE_AND_RESIZE_MENU} tile item"
+            )
+            })?;
+        press_ax_element(side_item.0, "native tile item")?;
+    }
+    Ok(())
+}
+
+fn unsafe_fill_focused_window() -> ResultType<()> {
+    unsafe {
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let frontmost_application: id = msg_send![workspace, frontmostApplication];
+        if frontmost_application.is_null() {
+            bail!("macOS did not provide a focused application");
+        }
+        let pid: i32 = msg_send![frontmost_application, processIdentifier];
+        let application = CfObject(AXUIElementCreateApplication(pid));
+        if application.0.is_null() {
+            bail!("macOS could not access the focused application");
+        }
+        let menu_bar = CfObject(copy_ax_attribute(
+            application.0,
+            NSString::alloc(nil).init_str(AX_MENU_BAR) as _,
+            "focused application menu bar",
+        )?);
+        let window_menu = find_ax_descendant(menu_bar.0, WINDOW_MENU_TITLES, 2)?
+            .ok_or_else(|| anyhow!("The focused application has no {WINDOW_MENU} menu"))?;
+        press_ax_element(window_menu.0, WINDOW_MENU)?;
+        let fill_item = find_ax_descendant(window_menu.0, FILL_MENU_TITLES, 3)?
+            .ok_or_else(|| anyhow!("The focused application has no {WINDOW_MENU} > Fill item"))?;
+        press_ax_element(fill_item.0, "native fill item")?;
+    }
+    Ok(())
+}
+
+unsafe fn copy_ax_attribute(
+    element: *const c_void,
+    attribute: CFStringRef,
+    name: &str,
+) -> ResultType<*const c_void> {
+    let mut value = std::ptr::null();
+    check_ax_status(
+        AXUIElementCopyAttributeValue(element, attribute, &mut value),
+        &format!("get the {name}"),
+    )?;
+    if value.is_null() {
+        bail!("macOS returned no {name}");
+    }
+    Ok(value)
+}
+
+unsafe fn find_ax_descendant(
+    element: *const c_void,
+    titles: &[&str],
+    depth: usize,
+) -> ResultType<Option<CfObject>> {
+    if depth == 0 {
+        return Ok(None);
+    }
+    let mut children = std::ptr::null();
+    if AXUIElementCopyAttributeValue(
+        element,
+        NSString::alloc(nil).init_str(AX_CHILDREN) as _,
+        &mut children,
+    ) != 0
+        || children.is_null()
+    {
+        return Ok(None);
+    }
+    let children = CfObject(children);
+    for index in 0..CFArrayGetCount(children.0 as _) {
+        let child = CFArrayGetValueAtIndex(children.0 as _, index) as *const c_void;
+        if ax_element_has_title(child, titles) {
+            CFRetain(child);
+            return Ok(Some(CfObject(child)));
+        }
+        if let Some(descendant) = find_ax_descendant(child, titles, depth - 1)? {
+            return Ok(Some(descendant));
+        }
+    }
+    Ok(None)
+}
+
+unsafe fn ax_element_has_title(element: *const c_void, titles: &[&str]) -> bool {
+    let mut title = std::ptr::null();
+    if AXUIElementCopyAttributeValue(
+        element,
+        NSString::alloc(nil).init_str(AX_TITLE) as _,
+        &mut title,
+    ) != 0
+        || title.is_null()
+    {
+        return false;
+    }
+    let title = CfObject(title);
+    titles.iter().any(|expected_title| {
+        let expected_title: id = NSString::alloc(nil).init_str(expected_title);
+        let matches: BOOL = msg_send![title.0 as id, isEqualToString: expected_title];
+        matches == YES
+    })
+}
+
+unsafe fn press_ax_element(element: *const c_void, name: &str) -> ResultType<()> {
+    check_ax_status(
+        AXUIElementPerformAction(element, NSString::alloc(nil).init_str(AX_PRESS) as _),
+        &format!("select {name}"),
+    )
+}
+
+fn check_ax_status(status: i32, action: &str) -> ResultType<()> {
+    if status != 0 {
+        bail!("macOS Accessibility could not {action}: AXError {status}");
     }
     Ok(())
 }
@@ -1182,7 +1388,10 @@ fn backup_update_plist(source: &str, backup: &str) -> ResultType<()> {
             Ok(())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            bail!("[root-update] required installed plist is missing: {}", source)
+            bail!(
+                "[root-update] required installed plist is missing: {}",
+                source
+            )
         }
         Err(err) => Err(err.into()),
     }
@@ -1194,7 +1403,10 @@ fn validate_update_tree(path: &Path, framework_root: Option<&Path>) -> ResultTyp
         // Frameworks legitimately use internal symlinks (Resources,
         // Versions/Current), but never allow a link to leave its framework.
         let Some(framework_root) = framework_root else {
-            bail!("[root-update] symlink outside framework: {}", path.display());
+            bail!(
+                "[root-update] symlink outside framework: {}",
+                path.display()
+            );
         };
         let target = std::fs::read_link(path)?;
         let target = if target.is_absolute() {
@@ -1283,10 +1495,19 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let agent_plist = format!("/Library/LaunchAgents/com.carriez.{}_server.plist", app_name);
-    let daemon_plist = format!("/Library/LaunchDaemons/com.carriez.{}_service.plist", app_name);
+    let agent_plist = format!(
+        "/Library/LaunchAgents/com.carriez.{}_server.plist",
+        app_name
+    );
+    let daemon_plist = format!(
+        "/Library/LaunchDaemons/com.carriez.{}_service.plist",
+        app_name
+    );
 
-    log::info!("[root-update] Starting silent root update from {}", dmg_path);
+    log::info!(
+        "[root-update] Starting silent root update from {}",
+        dmg_path
+    );
     // Check sessions before extracting to avoid unnecessary work
     if !crate::updater::has_no_active_conns_ipc() {
         bail!("[root-update] Active session detected, deferring update.");
@@ -1385,7 +1606,10 @@ pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> Result
     // launching a freshly extracted service binary from /tmp is not required.
     let new_service = format!("{}/Contents/MacOS/service", src_app);
     if !std::path::Path::new(&new_service).is_file() {
-        bail!("[root-update] staged service binary is missing: {}", new_service);
+        bail!(
+            "[root-update] staged service binary is missing: {}",
+            new_service
+        );
     }
     // The new binary writes its own plist definitions after the bundle is
     // moved into its final root-owned location.  This avoids executing code

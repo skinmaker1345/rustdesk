@@ -32,6 +32,17 @@ use winapi::um::winuser::WHEEL_DELTA;
 const INVALID_CURSOR_POS: i32 = i32::MIN;
 const INVALID_DISPLAY_IDX: i32 = -1;
 
+#[cfg(target_os = "macos")]
+static MACOS_LEFT_TILE_LEFT_ARROW_DOWN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MACOS_RIGHT_TILE_RIGHT_ARROW_DOWN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MACOS_TOP_TILE_UP_ARROW_DOWN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MACOS_BOTTOM_TILE_DOWN_ARROW_DOWN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MACOS_FILL_RETURN_DOWN: AtomicBool = AtomicBool::new(false);
+
 #[derive(Default)]
 struct StateCursor {
     hcursor: u64,
@@ -1619,6 +1630,11 @@ fn reset_input() {
         let _lock = VIRTUAL_INPUT_MTX.lock();
         VIRTUAL_INPUT_STATE = VirtualInputState::new();
     }
+    MACOS_LEFT_TILE_LEFT_ARROW_DOWN.store(false, Ordering::SeqCst);
+    MACOS_RIGHT_TILE_RIGHT_ARROW_DOWN.store(false, Ordering::SeqCst);
+    MACOS_TOP_TILE_UP_ARROW_DOWN.store(false, Ordering::SeqCst);
+    MACOS_BOTTOM_TILE_DOWN_ARROW_DOWN.store(false, Ordering::SeqCst);
+    MACOS_FILL_RETURN_DOWN.store(false, Ordering::SeqCst);
 }
 
 #[cfg(target_os = "macos")]
@@ -1653,6 +1669,63 @@ fn select_next_macos_input_source() {
     if let Err(err) = crate::platform::macos::select_next_input_source() {
         log::error!("Failed to select the next macOS input source: {err}");
     }
+}
+
+#[cfg(target_os = "macos")]
+fn handle_macos_map_window_tile(evt: &KeyEvent) -> bool {
+    const MACOS_LEFT_CONTROL_KEYCODE: KeyCode = 0x3B;
+    const MACOS_LEFT_OPTION_KEYCODE: KeyCode = 0x3A;
+    const MACOS_RETURN_KEYCODE: KeyCode = 0x24;
+    const MACOS_LEFT_ARROW_KEYCODE: KeyCode = 0x7B;
+    const MACOS_RIGHT_ARROW_KEYCODE: KeyCode = 0x7C;
+    const MACOS_DOWN_ARROW_KEYCODE: KeyCode = 0x7D;
+    const MACOS_UP_ARROW_KEYCODE: KeyCode = 0x7E;
+
+    let (handled_arrow, tile_window): (&AtomicBool, fn() -> ResultType<()>) =
+        match evt.chr() as KeyCode {
+            MACOS_LEFT_ARROW_KEYCODE => (
+                &MACOS_LEFT_TILE_LEFT_ARROW_DOWN,
+                crate::platform::macos::tile_focused_window_left,
+            ),
+            MACOS_RIGHT_ARROW_KEYCODE => (
+                &MACOS_RIGHT_TILE_RIGHT_ARROW_DOWN,
+                crate::platform::macos::tile_focused_window_right,
+            ),
+            MACOS_UP_ARROW_KEYCODE => (
+                &MACOS_TOP_TILE_UP_ARROW_DOWN,
+                crate::platform::macos::tile_focused_window_top,
+            ),
+            MACOS_DOWN_ARROW_KEYCODE => (
+                &MACOS_BOTTOM_TILE_DOWN_ARROW_DOWN,
+                crate::platform::macos::tile_focused_window_bottom,
+            ),
+            MACOS_RETURN_KEYCODE => (
+                &MACOS_FILL_RETURN_DOWN,
+                crate::platform::macos::fill_focused_window,
+            ),
+            _ => return false,
+        };
+    if !evt.down {
+        return handled_arrow.swap(false, Ordering::SeqCst);
+    }
+
+    let control = RawKey::MacVirtualKeycode(MACOS_LEFT_CONTROL_KEYCODE);
+    let option = RawKey::MacVirtualKeycode(MACOS_LEFT_OPTION_KEYCODE);
+    let modifiers = KEYS_DOWN.lock().unwrap();
+    let is_chord = modifiers.contains_key(&KeysDown::RdevKey(control))
+        && modifiers.contains_key(&KeysDown::RdevKey(option));
+    drop(modifiers);
+    if !is_chord {
+        return false;
+    }
+
+    #[cfg(debug_assertions)]
+    log::warn!("input: host map key Control + Option + Arrow -> tile focused window");
+    handled_arrow.store(true, Ordering::SeqCst);
+    if let Err(err) = tile_window() {
+        log::error!("Failed to tile the focused macOS window: {err}");
+    }
+    true
 }
 
 #[cfg(target_os = "windows")]
@@ -1758,6 +1831,9 @@ fn map_keyboard_mode(evt: &KeyEvent) {
             if evt.down {
                 select_next_macos_input_source();
             }
+            return;
+        }
+        if handle_macos_map_window_tile(evt) {
             return;
         }
         sim_rdev_rawkey_position(evt.chr() as _, evt.down);

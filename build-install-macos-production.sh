@@ -7,9 +7,14 @@ readonly RUST_BIN_DIR="${RUST_BIN_DIR:-$HOME/.rustup/toolchains/1.81.0-aarch64-a
 readonly VCPKG_ROOT="${VCPKG_ROOT:-$HOME/vcpkg}"
 readonly GNU_SED_BIN_DIR="${GNU_SED_BIN_DIR:-/opt/homebrew/opt/gnu-sed/libexec/gnubin}"
 readonly SIGNING_IDENTITY="${SIGNING_IDENTITY:-Apple Development: Sunghyun Cho (9XZ7YFMATF)}"
-readonly DESTINATION="$HOME/Applications/RustDesk Dev.app"
+readonly DEV_APP_NAME="${DEV_APP_NAME:-RustDesk Dev}"
+readonly DEV_BUNDLE_ID="${DEV_BUNDLE_ID:-dev.skinmaker.rustdesk.macos}"
+readonly DESTINATION="$HOME/Applications/$DEV_APP_NAME.app"
 readonly ENTITLEMENTS="$REPOSITORY_ROOT/flutter/macos/Runner/Release.entitlements"
 readonly ARM64_XCCONFIG="$REPOSITORY_ROOT/flutter/macos/Runner/Configs/Arm64.xcconfig"
+readonly SERVICE_BINARY="$REPOSITORY_ROOT/target/release/service"
+readonly DEV_LAUNCH_AGENT_LABEL="$DEV_BUNDLE_ID.server"
+readonly DEV_LAUNCH_AGENT="$HOME/Library/LaunchAgents/$DEV_LAUNCH_AGENT_LABEL.plist"
 
 require_file() {
   if [[ ! -x "$1" ]]; then
@@ -63,6 +68,7 @@ bash .github/patches/apply_flutter_3.44_source_patches.sh
 pod install --project-directory=flutter/macos
 
 cargo build --release --locked --features flutter
+require_file "$SERVICE_BINARY"
 (
   cd flutter
   XCODE_XCCONFIG_FILE="$ARM64_XCCONFIG" "$FLUTTER_BIN" build macos --release
@@ -87,10 +93,12 @@ cleanup() {
 trap cleanup EXIT
 
 ditto "$SOURCE_APP" "$staged_app"
-/usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier dev.skinmaker.rustdesk.macos' "$staged_app/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c 'Set :CFBundleName RustDesk Dev' "$staged_app/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName RustDesk Dev' "$staged_app/Contents/Info.plist" 2>/dev/null ||
-  /usr/libexec/PlistBuddy -c 'Add :CFBundleDisplayName string RustDesk Dev' "$staged_app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $DEV_BUNDLE_ID" "$staged_app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleName $DEV_APP_NAME" "$staged_app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DEV_APP_NAME" "$staged_app/Contents/Info.plist" 2>/dev/null ||
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $DEV_APP_NAME" "$staged_app/Contents/Info.plist"
+cp "$SERVICE_BINARY" "$staged_app/Contents/MacOS/service"
+printf '{"app-name":"%s"}\n' "$DEV_APP_NAME" > "$staged_app/Contents/Resources/custom.txt"
 
 codesign --force --deep --sign "$SIGNING_IDENTITY" --entitlements "$ENTITLEMENTS" "$staged_app"
 codesign --verify --deep --strict --verbose=2 "$staged_app"
@@ -101,6 +109,39 @@ fi
 mv "$staged_app" "$DESTINATION"
 installed=true
 
+mkdir -p "$(dirname "$DEV_LAUNCH_AGENT")"
+cat > "$DEV_LAUNCH_AGENT" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$DEV_LAUNCH_AGENT_LABEL</string>
+  <key>AssociatedBundleIdentifiers</key>
+  <string>$DEV_BUNDLE_ID</string>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$DESTINATION/Contents/MacOS/RustDesk</string>
+    <string>--server</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>$DESTINATION/Contents/MacOS</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/Library/Logs/$DEV_APP_NAME-server.err</string>
+  <key>StandardOutPath</key>
+  <string>$HOME/Library/Logs/$DEV_APP_NAME-server.out</string>
+</dict>
+</plist>
+EOF
+plutil -lint "$DEV_LAUNCH_AGENT"
+launchctl bootout "gui/$(id -u)/$DEV_LAUNCH_AGENT_LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$DEV_LAUNCH_AGENT"
+
 echo "Installed Release build at: $DESTINATION"
 /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$DESTINATION/Contents/Info.plist"
 codesign -dv --verbose=2 "$DESTINATION" 2>&1 | grep -E 'Identifier=|TeamIdentifier='
+launchctl print "gui/$(id -u)/$DEV_LAUNCH_AGENT_LABEL" | grep -E 'state =|path ='
